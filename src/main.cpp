@@ -1,81 +1,88 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_ADS1X15.h>
 #include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
-// --- Hardware Object Instantiation ---
-Adafruit_ADS1115 ads; // Initialize the 16-bit ADC at default I2C address 0x48
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Initialize LCD at I2C address 0x27 (16 cols, 2 rows)
+// --- Hardware Mapping ---
+#define ONE_WIRE_BUS 2 // The digital pin connected to the DS18B20 Yellow Data Wire
 
-// --- System Constants & Calibration ---
-const float REFERENCE_RESISTOR = 1000.0; // Your 1k Ohm reference resistor in the voltage divider
-const float VDD = 5.0; // The theoretical 5V supply from the Arduino
-const float RTD_NOMINAL = 100.0; // Resistance of PT100 at 0 degrees Celsius
+// --- Object Instantiation ---
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Standard I2C address 0x27 for a 16x2 display
 
-// --- Non-Blocking Timer Variables ---
+// --- Deterministic Execution Variables ---
 unsigned long previousMillis = 0;
-const long pollingInterval = 500; // Poll data and update screen every 500 milliseconds
+const long pollingInterval = 1000; // Update the screen and fetch data every 1 second
+float currentTempC = 0.0; // Global variable to hold the latest valid data
 
 void setup() {
   Serial.begin(9600);
   
-  // Initialize I2C Bus for both devices
-  Wire.begin();
-  
-  // Boot LCD
+  // 1. Initialize Display
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("System Booting..");
+  lcd.print("Booting Core...");
+
+  // 2. Initialize Sensor Bus
+  sensors.begin();
   
-  // Boot ADS1115
-  // We use 1x gain (+/- 4.096V) since our voltage divider will output around 0.45V
-  ads.setGain(GAIN_ONE); 
-  if (!ads.begin()) {
-    lcd.clear();
-    lcd.print("ADC Error!");
-    while (1); // Halt execution on hardware failure
-  }
+  // 3. The Low-Latency Configuration (Crucial for MVP Performance)
+  // This tells the sensor to calculate temperature in the background without pausing the Arduino
+  sensors.setWaitForConversion(false); 
   
-  delay(1000); // Short blocking delay only acceptable during boot sequence
+  // Set to 12-bit resolution for maximum precision (0.0625°C increments)
+  sensors.setResolution(12); 
+
+  // Send the very first background request before the loop starts
+  sensors.requestTemperatures(); 
+  
+  delay(1000); // Allow hardware to stabilize
   lcd.clear();
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Execute this block strictly every 500ms without halting the microcontroller
+  // Execute this block strictly every 1000ms without blocking the processor
   if (currentMillis - previousMillis >= pollingInterval) {
     previousMillis = currentMillis;
 
-    // 1. Data Acquisition: Read raw ADC value from Pin A0 on the ADS1115
-    int16_t adc0 = ads.readADC_SingleEnded(0);
-    
-    // 2. Voltage Conversion: Convert raw ADC integer to measurable voltage
-    float volts0 = ads.computeVolts(adc0);
+    // 1. Data Retrieval: Pull the temperature calculated during the LAST 1000ms
+    // Index 0 refers to the first sensor on the wire.
+    currentTempC = sensors.getTempCByIndex(0);
 
-    // 3. Resistance Calculation: Solve the Voltage Divider equation for R2 (the RTD)
-    // Formula: R_rtd = R_ref * (V_measured / (VDD - V_measured))
-    float rtdResistance = REFERENCE_RESISTOR * (volts0 / (VDD - volts0));
+    // 2. Data Request: Tell the sensor to start calculating the NEXT temperature in the background
+    sensors.requestTemperatures();
 
-    // 4. Temperature Derivation: Linear approximation for PT100 (MVP Level)
-    // A PT100 increases by approx 0.385 ohms per degree Celsius.
-    float temperatureC = (rtdResistance - RTD_NOMINAL) / 0.385;
-
-    // 5. Output to Display
-    lcd.setCursor(0, 0);
-    lcd.print("Temp: ");
-    lcd.print(temperatureC, 2); // Display to 2 decimal places
-    lcd.print(" C   "); // Trailing spaces to overwrite old, longer strings
-
-    lcd.setCursor(0, 1);
-    lcd.print("Res: ");
-    lcd.print(rtdResistance, 1);
-    lcd.print(" Ohm ");
-
-    // Optional: Output to Serial Monitor for debugging / logging
-    Serial.print("V: "); Serial.print(volts0, 4);
-    Serial.print(" | R: "); Serial.print(rtdResistance, 2);
-    Serial.print(" | T: "); Serial.println(temperatureC, 2);
+    // 3. Error Handling: The sensor returns -127.00 if the wire is disconnected
+    if (currentTempC <= -100.0) {
+      lcd.setCursor(0, 0);
+      lcd.print("SENSOR FAULT!   ");
+      lcd.setCursor(0, 1);
+      lcd.print("Check Wiring.   ");
+      Serial.println("ERR: DS18B20 Open Circuit Detected.");
+    } else {
+      // 4. Data Output to Screen
+      lcd.setCursor(0, 0);
+      lcd.print("Water Temp:     "); // Trailing spaces clear old characters
+      
+      lcd.setCursor(0, 1);
+      lcd.print(currentTempC, 2); // Render to 2 decimal places
+      lcd.print(" ");
+      lcd.print((char)223); // Renders the physical degree symbol '°'
+      lcd.print("C       ");
+      
+      // Output to Serial for logging
+      Serial.print("Data Stream -> Temp: ");
+      Serial.print(currentTempC, 4); // Serial outputs deeper precision
+      Serial.println(" C");
+    }
   }
+  
+  // Because we used setWaitForConversion(false) and millis(), 
+  // you can safely add other logic here (like reading a flow sensor or pressing buttons)
+  // and the processor will respond instantly.
 }
